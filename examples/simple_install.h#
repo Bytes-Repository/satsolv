@@ -1,0 +1,85 @@
+mod lib
+
+;; Mapuje stałe lib::transaction::* na czytelny opis — unika ryzykownego
+;; to_string() na surowym i32 (patrz komentarz w H# codegen o hsh_val_to_str
+;; zgadującym "int czy wskaźnik do stringa" po samej wielkości liczby).
+fn transaction_type_name(type_id: i32) -> string is
+    if type_id == lib::transaction::INSTALL      is return "instalacja" end
+    if type_id == lib::transaction::ERASE        is return "usuniecie" end
+    if type_id == lib::transaction::UPGRADE      is return "aktualizacja" end
+    if type_id == lib::transaction::UPGRADED     is return "zaktualizowany (stara wersja)" end
+    if type_id == lib::transaction::DOWNGRADE    is return "degradacja" end
+    if type_id == lib::transaction::REINSTALL    is return "reinstalacja" end
+    if type_id == lib::transaction::OBSOLETES    is return "zastepuje inny pakiet" end
+    if type_id == lib::transaction::MULTIINSTALL is return "wielokrotna instalacja" end
+    return "inny"
+end
+
+fn main() is
+    let p: int = lib::pool::create()
+    lib::pool::set_arch(p, "x86_64")
+
+    let system: int = lib::repo::create(p, "system")
+    lib::pool::set_installed(p, system)
+    lib::repo::internalize(system)
+
+    let available: int = lib::repo::create(p, "available")
+    lib::repo::set_priority(available, 10, 0)
+
+    let foo: lib::repo::Pkg = lib::repo::new_pkg("foo", "1.0", "1", "x86_64")
+    let mut bar: lib::repo::Pkg = lib::repo::new_pkg("bar", "2.0", "1", "x86_64")
+    bar.requires = ["foo"]
+
+    match lib::repo::add_packages(p, available, [foo, bar]) is
+        lib::SatResult::Ok(rc) => is end
+        lib::SatResult::Err(msg) => is
+            write("Blad wczytywania pakietow: " + msg)
+            return
+        end
+    end
+    lib::repo::internalize(available)
+
+    lib::pool::createwhatprovides(p)
+
+    let jobs: int = lib::queue::new()
+    match lib::job::install_name_version(jobs, p, "bar", ">=", "1.5") is
+        lib::SatResult::Ok(rel_id) => is end
+        lib::SatResult::Err(msg) => is
+            write("Blad joba: " + msg)
+            return
+        end
+    end
+
+    let s: int = lib::solver::create(p)
+    ;; przykladowa konfiguracja solvera
+    lib::solver::allow_downgrade(s, false)
+    lib::solver::best_obey_policy(s, true)
+
+    let problems: i32 = lib::solver::solve(s, jobs)
+
+    if problems > 0 is
+        write("Solver zglosil problemy:")
+        for msg in lib::solver::all_problems_as_strings(s) is
+            write("  - " + msg)
+        end
+    else is
+        write("Pakiety do zainstalowania:")
+        let t: int = lib::transaction::create_from_solver(s)
+        for sid in lib::transaction::installed_result(t) is
+            write("  - " + lib::pool::solvable_to_str(p, sid))
+        end
+
+        write("Podsumowanie klas transakcji:")
+        for cls in lib::transaction::classify_active(t) is
+            write("  typ=" + transaction_type_name(cls.type_id))
+        end
+
+        lib::transaction::free(t)
+    end
+
+    lib::queue::free(jobs)
+    lib::solver::free(s)
+    lib::repo::free(available, false)
+    lib::repo::free(system, false)
+    lib::pool::free(p)
+end
