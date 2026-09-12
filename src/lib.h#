@@ -1,1 +1,913 @@
+extern static [c] is
+    fn tmpfile() -> int
+    fn fopen(path: string, mode: string) -> int
+    fn fputs(s: string, stream: int) -> i32
+    fn fclose(stream: int) -> i32
+    fn rewind(stream: int)
+end
 
+;; ---------------------------------------------------------------------------
+;; libsolv (rdzeń) — wszystkie poniższe to prawdziwe symbole `extern`
+;; z src/pool.h, src/poolid.h, src/evr.h, src/repo.h, src/queue.h,
+;; src/solver.h, src/transaction.h (zweryfikowane wobec src/libsolv.ver)
+;; ---------------------------------------------------------------------------
+extern static [c, "libsolv"] is
+    ;; -- pool.h / poolid.h / evr.h --
+    fn pool_create() -> int
+    fn pool_free(pool: int)
+    fn pool_setdebuglevel(pool: int, level: i32)
+    fn pool_setarch(pool: int, arch: string)
+    fn pool_set_installed(pool: int, repo: int)
+    fn pool_createwhatprovides(pool: int)
+    fn pool_str2id(pool: int, s: string, create: i32) -> i32
+    fn pool_id2str(pool: int, id: i32) -> string
+    fn pool_id2rel(pool: int, id: i32) -> string
+    fn pool_id2evr(pool: int, id: i32) -> string
+    fn pool_dep2str(pool: int, dep: i32) -> string
+    fn pool_rel2id(pool: int, name: i32, evr: i32, flags: i32, create: i32) -> i32
+    fn pool_evrcmp(pool: int, evr1: i32, evr2: i32, mode: i32) -> i32
+    fn pool_evrcmp_str(pool: int, evr1: string, evr2: string, mode: i32) -> i32
+    fn pool_setdisttype(pool: int, disttype: i32) -> i32
+    fn pool_errstr(pool: int) -> string
+    fn pool_solvable2str(pool: int, p: i32) -> string
+    fn pool_job2str(pool: int, how: i32, what: i32, flagmask: i32) -> string
+
+    ;; -- repo.h --
+    fn repo_create(pool: int, name: string) -> int
+    fn repo_free(repo: int, reuseids: i32)
+    fn repo_add_solvable(repo: int) -> i32
+    fn repo_internalize(repo: int)
+    fn repo_add_solv(repo: int, fp: int, flags: i32) -> i32
+
+    ;; -- queue.h (tylko realnie eksportowane symbole — patrz uwaga #3 wyżej) --
+    fn queue_init(q: int)
+    fn queue_free(q: int)
+    fn queue_alloc_one(q: int)
+
+    ;; -- solver.h --
+    fn solver_create(pool: int) -> int
+    fn solver_free(solv: int)
+    fn solver_solve(solv: int, job: int) -> i32
+    fn solver_create_transaction(solv: int) -> int
+    fn solver_set_flag(solv: int, flag: i32, value: i32) -> i32
+    fn solver_get_flag(solv: int, flag: i32) -> i32
+    fn solver_problem_count(solv: int) -> i32
+    fn solver_next_problem(solv: int, problem: i32) -> i32
+    fn solver_solution_count(solv: int, problem: i32) -> i32
+    fn solver_findallproblemrules(solv: int, problem: i32, rules: int)
+    fn solver_problem2str(solv: int, problem: i32) -> string
+
+    ;; -- transaction.h --
+    fn transaction_free(trans: int)
+    fn transaction_type(trans: int, p: i32, mode: i32) -> i32
+    fn transaction_classify(trans: int, mode: i32, classes: int)
+    fn transaction_classify_pkgs(trans: int, mode: i32, type_id: i32, from_id: i32, to_id: i32, pkgs: int)
+    fn transaction_installedresult(trans: int, installedq: int) -> i32
+end
+
+;; ---------------------------------------------------------------------------
+;; libsolvext — rozszerzenia; potrzebujemy tylko parsera formatu "testtags"
+;; ---------------------------------------------------------------------------
+extern static [c, "libsolvext"] is
+    fn testcase_add_testtags(repo: int, fp: int, flags: i32) -> i32
+end
+
+;; ============================================================================
+;; SatResult<T> — jednolita obsługa błędów dla operacji, które faktycznie
+;; mogą zawieść (I/O, parsowanie repo). Nazwa "SatResult" (nie "Result"),
+;; żeby nie kolidować z ewentualnym własnym typem Result osoby używającej
+;; tej biblioteki po zaimportowaniu jej pod aliasem.
+;; ============================================================================
+pub enum SatResult<T> is
+    Ok(T)
+    Err(string)
+end
+
+;; ============================================================================
+;; mod pool — cykl życia Pool + internowanie stringów/Id + porównania wersji
+;; ============================================================================
+mod pool is
+    ;; Flagi relacji dla rel2id() — src/pool.h
+    pub const REL_EQ: i32 = 2
+    pub const REL_GT: i32 = 1
+    pub const REL_LT: i32 = 4
+
+    ;; Tryby dla evrcmp() — src/evr.h
+    pub const EVRCMP_COMPARE:         i32 = 0
+    pub const EVRCMP_MATCH_RELEASE:   i32 = 1
+    pub const EVRCMP_MATCH:           i32 = 2
+    pub const EVRCMP_COMPARE_EVONLY:  i32 = 3
+
+    ;; Typy dystrybucji dla set_disttype() — src/pooltypes.h. Wpływa na
+    ;; semantykę porównywania wersji (rpm-style "1.0-1" vs deb-style
+    ;; epoch:wersja-revision itd.) — ustaw PRZED pool_setarch/set_arch.
+    pub const DISTTYPE_RPM:   i32 = 0
+    pub const DISTTYPE_DEB:   i32 = 1
+    pub const DISTTYPE_ARCH:  i32 = 2
+    pub const DISTTYPE_HAIKU: i32 = 3
+    pub const DISTTYPE_CONDA: i32 = 4
+    pub const DISTTYPE_APK:   i32 = 5
+
+    pub fn create() -> int is
+        return pool_create()
+    end
+
+    pub fn free(p: int) is
+        pool_free(p)
+    end
+
+    pub fn set_debug_level(p: int, level: i32) is
+        pool_setdebuglevel(p, level)
+    end
+
+    pub fn set_arch(p: int, arch: string) is
+        pool_setarch(p, arch)
+    end
+
+    pub fn set_installed(p: int, repo: int) is
+        pool_set_installed(p, repo)
+    end
+
+    ;; Trzeba wywołać po dodaniu wszystkich repo, przed solver_create/solve.
+    pub fn createwhatprovides(p: int) is
+        pool_createwhatprovides(p)
+    end
+
+    pub fn str2id(p: int, s: string, create_if_missing: bool) -> i32 is
+        let c: i32 = if create_if_missing then 1 else 0
+        return pool_str2id(p, s, c)
+    end
+
+    pub fn id2str(p: int, id: i32) -> string is
+        return pool_id2str(p, id)
+    end
+
+    pub fn dep2str(p: int, dep: i32) -> string is
+        return pool_dep2str(p, dep)
+    end
+
+    ;; Buduje Id relacji "name <flags> evr", np. do "foo >= 1.2-3".
+    pub fn rel2id(p: int, name: i32, evr: i32, flags: i32) -> i32 is
+        return pool_rel2id(p, name, evr, flags, 1)
+    end
+
+    pub fn evrcmp(p: int, evr1: i32, evr2: i32) -> i32 is
+        return pool_evrcmp(p, evr1, evr2, EVRCMP_COMPARE)
+    end
+
+    ;; Jak evrcmp(), ale bez wcześniejszego internowania stringów przez
+    ;; str2id — wygodniejsze do jednorazowych porównań ("1.0-1" vs "2.0-1")
+    ;; bez zaśmiecania Pool nowymi Id, których nikt więcej nie użyje.
+    ;; Zwraca <0 gdy evr1 < evr2, 0 gdy równe, >0 gdy evr1 > evr2.
+    pub fn evrcmp_str(p: int, evr1: string, evr2: string) -> i32 is
+        return pool_evrcmp_str(p, evr1, evr2, EVRCMP_COMPARE)
+    end
+
+    ;; Ustawia typ dystrybucji (wpływa na semantykę porównywania wersji —
+    ;; rpm/deb/arch/apk/conda mają różne reguły). Zwraca poprzedni disttype
+    ;; przy sukcesie, -1 jeśli podany disttype nie jest wspierany.
+    ;; UWAGA: wywołaj przed set_arch() — pool_setarch zależy od disttype.
+    pub fn set_disttype(p: int, disttype: i32) -> i32 is
+        return pool_setdisttype(p, disttype)
+    end
+
+    pub fn errstr(p: int) -> string is
+        return pool_errstr(p)
+    end
+
+    pub fn solvable_to_str(p: int, solvable_id: i32) -> string is
+        return pool_solvable2str(p, solvable_id)
+    end
+
+    pub fn job_to_str(p: int, how: i32, what: i32) -> string is
+        return pool_job2str(p, how, what, 0)
+    end
+end
+
+;; ============================================================================
+;; mod queue — libsolv Queue (Id[]) w czystym H#. Zobacz uwagę projektową #3.
+;; ============================================================================
+mod queue is
+    ;; Layout struct Queue z src/queue.h (niezmienny od dawna, ABI publiczne):
+    ;;   offset  0 : elements   (Id* — wskaźnik)
+    ;;   offset  8 : count      (i32)
+    ;;   offset 16 : alloc      (Id* — wskaźnik, wewnętrzny bufor)
+    ;;   offset 24 : left       (i32 — ile wolnych slotów zostało)
+    ;;   rozmiar   : 32 bajty
+    pub const STRUCT_SIZE: int = 32
+
+    ;; UWAGA PLATFORMOWA: powyższy layout/rozmiar zakłada 64-bitowe (LP64)
+    ;; wskaźniki — prawdziwe dla x86_64, aarch64 i riscv64 (jedyne natywne
+    ;; cele kompilatora H#, dla których w ogóle ma sens linkowanie z
+    ;; natywnym libsolv.so/.a). H# umie też kompilować na wasm32 (32-bitowe
+    ;; wskaźniki), gdzie te offsety byłyby błędne i cicho psułyby pamięć —
+    ;; ale wasm32 i tak nie potrafi zlinkować natywnej biblioteki C w
+    ;; standardowy sposób, więc to nie jest realny scenariusz użycia tej
+    ;; biblioteki. Mimo to `new()` poniżej weryfikuje to założenie w
+    ;; runtime zamiast po cichu ufać, patrz `assert_lp64_layout`.
+    ;;
+    ;; Ta biblioteka jest wspierana WYŁĄCZNIE na 64-bitowych celach.
+
+    ;; Samotest layoutu: `queue_init()` to prawdziwy, skompilowany kod
+    ;; libsolv — na LP64 zapisuje NULL (8 zerowych bajtów) na offsecie 0
+    ;; (elements) i offsecie 16 (alloc), oraz 0 na offsecie 8 (count) i 24
+    ;; (left). To niezależny test: jeśli rzeczywisty layout struct Queue
+    ;; na tej platformie różni się od założeń powyżej (np. 32-bitowe
+    ;; wskaźniki), przynajmniej jedno z tych czterech pól odczytane pod
+    ;; ZAŁOŻONYM przez nas offsetem prawie na pewno NIE wyzeruje się
+    ;; dokładnie tam, gdzie tego oczekujemy — nie jest to dowód
+    ;; matematyczny, ale w praktyce bardzo skuteczna siatka bezpieczeństwa
+    ;; (żeby przypadkiem przejść, "obcy" bajt musiałby akurat wylądować
+    ;; jako czyste zero na wszystkich 4 sprawdzanych polach).
+    fn assert_lp64_layout(q: int) is
+        let mut ok: bool = true
+        unsafe is
+            if ptr_read_i64(q, 0)  != 0 is ok = false end
+            if ptr_read_i32(q, 8)  != 0 is ok = false end
+            if ptr_read_i64(q, 16) != 0 is ok = false end
+            if ptr_read_i32(q, 24) != 0 is ok = false end
+        end
+        if !ok is
+            panic("satsolv: layout struct Queue nie zgadza sie z zalozeniem LP64 " +
+                  "(64-bitowe wskazniki). Ta platforma (prawdopodobnie 32-bitowa " +
+                  "albo wasm32) nie jest wspierana przez satsolv - zobacz README.md, " +
+                  "sekcja 'Uwagi techniczne'.")
+        end
+    end
+
+    ;; Alokuje i inicjalizuje nową, pustą kolejkę. Pamięć jest zarządzana
+    ;; refcountingiem (arc_alloc) — zwolnij jawnie przez queue::free()
+    ;; kiedy libsolv nie potrzebuje już danej kolejki.
+    pub fn new() -> int is
+        let mut q: int = 0
+        unsafe is
+            q = arc_alloc(STRUCT_SIZE)
+        end
+        queue_init(q)
+        assert_lp64_layout(q)
+        return q
+    end
+
+    pub fn free(q: int) is
+        queue_free(q)
+    end
+
+    pub fn count(q: int) -> i32 is
+        let mut n: i32 = 0
+        unsafe is
+            n = ptr_read_i32(q, 8)
+        end
+        return n
+    end
+
+    fn slots_left(q: int) -> i32 is
+        let mut n: i32 = 0
+        unsafe is
+            n = ptr_read_i32(q, 24)
+        end
+        return n
+    end
+
+    pub fn get(q: int, idx: i32) -> i32 is
+        let mut v: i32 = 0
+        unsafe is
+            let elems: int = ptr_read_ptr(q, 0)
+            v = ptr_read_i32(elems, idx * 4)
+        end
+        return v
+    end
+
+    ;; Odtwarza `queue_push` z queue.h (static inline w libsolv => brak
+    ;; eksportowanego symbolu). `queue_alloc_one` (rozrost bufora), którego
+    ;; tu używamy, JEST prawdziwym, zlinkowanym kodem libsolv.
+    pub fn push(q: int, id: i32) is
+        if slots_left(q) == 0 is
+            queue_alloc_one(q)
+        end
+        unsafe is
+            let elems: int = ptr_read_ptr(q, 0)
+            let n:     i32 = ptr_read_i32(q, 8)
+            ptr_write_i32(elems, n * 4, id)
+            ptr_write_i32(q, 8, n + 1)
+            ptr_write_i32(q, 24, ptr_read_i32(q, 24) - 1)
+        end
+    end
+
+    ;; libsolv koduje "joby" solvera jako pary (how, what) w jednej kolejce —
+    ;; to skrót na dwa push() pod rząd.
+    pub fn push2(q: int, a: i32, b: i32) is
+        push(q, a)
+        push(q, b)
+    end
+
+    ;; Zwraca zawartość kolejki jako zwykłą tablicę H# — wygodne do
+    ;; iterowania po wynikach (np. queue::to_array(problems_queue)).
+    pub fn to_array(q: int) -> [i32] is
+        let n: i32 = count(q)
+        let mut out: [i32] = []
+        let mut i: i32 = 0
+        while i < n is
+            out = array_push(out, get(q, i))
+            i += 1
+        end
+        return out
+    end
+end
+
+;; ============================================================================
+;; mod repo — cykl życia Repo + wczytywanie pakietów
+;; ============================================================================
+mod repo is
+    pub fn create(p: int, name: string) -> int is
+        return repo_create(p, name)
+    end
+
+    ;; reuseids: zwykle false, chyba że repo jest usuwane i odtwarzane
+    ;; w pętli i zależy Ci na ponownym użyciu zwolnionych Id.
+    pub fn free(r: int, reuseids: bool) is
+        let f: i32 = if reuseids then 1 else 0
+        repo_free(r, f)
+    end
+
+    ;; Wywołaj po dodaniu wszystkich pakietów do repo.
+    pub fn internalize(r: int) is
+        repo_internalize(r)
+    end
+
+    ;; Priorytet repo (wyżej = ważniejsze przy wyborze pakietu spośród
+    ;; kilku repo dostarczających to samo). `subpriority` służy tylko do
+    ;; sortowania (nie do przycinania kandydatów) — zwykle 0.
+    ;;
+    ;; UWAGA: to, podobnie jak `mod queue`, czyta/pisze bezpośrednio pola
+    ;; prawdziwej struktury C `Repo` (src/repo.h) pod stałym offsetem —
+    ;; `priority` leży na offsecie 48, `subpriority` na offsecie 52 (obie
+    ;; to zwykłe 4-bajtowe `int`, layout: name:ptr@0, repoid:i32@8,
+    ;; appdata:ptr@16, pool:ptr@24, start/end/nsolvables/disabled:i32@32..47,
+    ;; priority:i32@48, subpriority:i32@52 — pola te są publiczne w ABI
+    ;; libsolv, poza `#ifdef LIBSOLV_INTERNAL`, więc są stabilne). Ten sam
+    ;; zestaw zastrzeżeń co dla `queue` (LP64-only) obowiązuje tutaj — stąd
+    ;; ta sama samotestowa asercja przed dotknięciem pamięci.
+    pub fn set_priority(r: int, priority: i32, subpriority: i32) is
+        let probe: int = queue::new()
+        queue::free(probe)
+        unsafe is
+            ptr_write_i32(r, 48, priority)
+            ptr_write_i32(r, 52, subpriority)
+        end
+    end
+
+    pub fn get_priority(r: int) -> i32 is
+        let probe: int = queue::new()
+        queue::free(probe)
+        let mut v: i32 = 0
+        unsafe is
+            v = ptr_read_i32(r, 48)
+        end
+        return v
+    end
+
+    ;; Wczytuje binarny plik .solv (format natywny libsolv, produkowany
+    ;; np. przez rpmmd2solv/susetags2solv) — najbardziej "produkcyjna"
+    ;; droga zasilenia repo prawdziwymi metadanymi pakietów.
+    ;; `p` (Pool) jest potrzebny tylko do odczytania pool::errstr() przy
+    ;; błędzie — sam plik ląduje w `r` (Repo).
+    pub fn add_solv_file(p: int, r: int, path: string) -> SatResult<i32> is
+        let fp: int = fopen(path, "r")
+        if fp == 0 is
+            return SatResult::Err("nie mozna otworzyc pliku: " + path)
+        end
+        let rc: i32 = repo_add_solv(r, fp, 0)
+        fclose(fp)
+        if rc != 0 is
+            return SatResult::Err("repo_add_solv nie powiodlo sie: " + pool::errstr(p))
+        end
+        return SatResult::Ok(rc)
+    end
+
+    ;; --- opis pakietu do budowania repo "z palca" (bez pliku .solv) ---
+    pub struct Pkg is
+        pub name:       string
+        pub version:    string
+        pub release:    string  ;; np. "1" jeśli nie masz osobnego release
+        pub arch:       string  ;; np. "x86_64" albo "noarch"
+        pub requires:    [string]
+        pub provides:    [string]
+        pub conflicts:   [string]
+        pub obsoletes:   [string]
+        pub recommends:  [string]
+        pub suggests:    [string]
+    end
+
+    pub fn new_pkg(name: string, version: string, release: string, arch: string) -> Pkg is
+        return Pkg {
+            name: name, version: version, release: release, arch: arch,
+            requires: [], provides: [], conflicts: [],
+            obsoletes: [], recommends: [], suggests: []
+        }
+    end
+
+    ;; --- walidacja/escaping wejścia przed sklejeniem tekstu "testtags" ---
+    ;;
+    ;; Format testtags jest rozdzielany liniami: linia zaczyna się od
+    ;; "#>=Tag: " i trwa do końca linii. Jedyny sposób, żeby wartość pola
+    ;; "uciekła" poza swój tag i stała się osobną (dowolną!) linią
+    ;; "#>=...", to wstrzyknięcie znaku nowej linii (`\n`/`\r`) w wartość —
+    ;; np. `name = "foo\n#>=Pkg: zly-pakiet 1 1 x86_64"` bez walidacji
+    ;; wygenerowałoby DWA pakiety zamiast jednego. Dlatego każde pole
+    ;; przechodzi przez `is_clean_line` (zakaz \n/\r) przed sklejeniem, a
+    ;; pola name/version/release/arch (rozdzielane spacją w jednej linii
+    ;; "#>=Pkg: name version release arch") dodatkowo przez `is_clean_token`
+    ;; (zakaz białych znaków w ogóle, bo spacja przesunęłaby kolejne pola).
+
+    fn contains_char(s: string, ch: string) -> bool is
+        return string_find(s, ch) >= 0
+    end
+
+    fn is_clean_line(s: string) -> bool is
+        return !contains_char(s, "\n") && !contains_char(s, "\r")
+    end
+
+    fn is_clean_token(s: string) -> bool is
+        if !is_clean_line(s)        is return false end
+        if contains_char(s, " ")    is return false end
+        if contains_char(s, "\t")   is return false end
+        if s == ""                  is return false end
+        return true
+    end
+
+    fn check_dep_list(field_name: string, pkg_name: string, deps: [string]) -> string is
+        for d in deps is
+            if !is_clean_line(d) is
+                return "niedozwolony znak nowej linii w polu " + field_name +
+                       " pakietu '" + pkg_name + "': '" + d + "'"
+            end
+        end
+        return ""
+    end
+
+    ;; Zwraca "" gdy pakiet jest bezpieczny do wstrzyknięcia w tekst
+    ;; testtags, w przeciwnym razie opis błędu.
+    fn validate_pkg(p: Pkg) -> string is
+        if !is_clean_token(p.name) is
+            return "nieprawidlowa nazwa pakietu: '" + p.name + "' (wymagany pojedynczy token, bez spacji/nowej linii)"
+        end
+        if !is_clean_token(p.version) is
+            return "nieprawidlowa wersja pakietu '" + p.name + "': '" + p.version + "'"
+        end
+        if !is_clean_token(p.release) is
+            return "nieprawidlowy release pakietu '" + p.name + "': '" + p.release + "'"
+        end
+        if !is_clean_token(p.arch) is
+            return "nieprawidlowa architektura pakietu '" + p.name + "': '" + p.arch + "'"
+        end
+        let mut err: string = ""
+        err = check_dep_list("Requires", p.name, p.requires)
+        if err != "" is return err end
+        err = check_dep_list("Provides", p.name, p.provides)
+        if err != "" is return err end
+        err = check_dep_list("Conflicts", p.name, p.conflicts)
+        if err != "" is return err end
+        err = check_dep_list("Obsoletes", p.name, p.obsoletes)
+        if err != "" is return err end
+        err = check_dep_list("Recommends", p.name, p.recommends)
+        if err != "" is return err end
+        err = check_dep_list("Suggests", p.name, p.suggests)
+        if err != "" is return err end
+        return ""
+    end
+
+    fn tag_lines(tag: string, deps: [string]) -> string is
+        let mut out: string = ""
+        for d in deps is
+            out = out + "#>=" + tag + ": " + d + "\n"
+        end
+        return out
+    end
+
+    fn pkg_to_testtags(p: Pkg) -> string is
+        let mut out: string = "#>=Pkg: " + p.name + " " + p.version + " " +
+                               p.release + " " + p.arch + "\n"
+        out = out + tag_lines("Req", p.requires)
+        out = out + tag_lines("Prv", p.provides)
+        out = out + tag_lines("Con", p.conflicts)
+        out = out + tag_lines("Obs", p.obsoletes)
+        out = out + tag_lines("Rec", p.recommends)
+        out = out + tag_lines("Sug", p.suggests)
+        return out
+    end
+
+    ;; Dodaje listę pakietów do repo przez oficjalny parser libsolvext
+    ;; formatu "testtags" (`testcase_add_testtags`) — bez dotykania
+    ;; wewnętrznego layoutu struct Solvable. Każdy pakiet jest najpierw
+    ;; zwalidowany (patrz `validate_pkg` wyżej) — przy pierwszym
+    ;; niebezpiecznym polu funkcja zwraca błąd i NIC nie zapisuje.
+    ;; `p` (Pool) jest potrzebny tylko do pool::errstr() przy błędzie.
+    pub fn add_packages(p: int, r: int, pkgs: [Pkg]) -> SatResult<i32> is
+        for pk in pkgs is
+            let err: string = validate_pkg(pk)
+            if err != "" is
+                return SatResult::Err(err)
+            end
+        end
+
+        let mut text: string = ""
+        for pk in pkgs is
+            text = text + pkg_to_testtags(pk)
+        end
+
+        let fp: int = tmpfile()
+        if fp == 0 is
+            return SatResult::Err("nie udalo sie utworzyc pliku tymczasowego (tmpfile)")
+        end
+        fputs(text, fp)
+        rewind(fp)
+        let rc: i32 = testcase_add_testtags(r, fp, 0)
+        fclose(fp)
+
+        if rc != 0 is
+            return SatResult::Err("testcase_add_testtags nie powiodlo sie: " + pool::errstr(p))
+        end
+        return SatResult::Ok(rc)
+    end
+end
+
+;; ============================================================================
+;; mod job — stałe SOLVER_* (src/solver.h) + budowanie kolejki zadań solvera
+;; ============================================================================
+mod job is
+    ;; -- SOLVER_SELECTMASK: co wybieramy (najmłodszy bajt) --
+    pub const SOLVABLE:          i32 = 0x01
+    pub const SOLVABLE_NAME:     i32 = 0x02
+    pub const SOLVABLE_PROVIDES: i32 = 0x03
+    pub const SOLVABLE_ONE_OF:   i32 = 0x04
+    pub const SOLVABLE_REPO:     i32 = 0x05
+    pub const SOLVABLE_ALL:      i32 = 0x06
+    pub const SELECTMASK:        i32 = 0xff
+
+    ;; -- SOLVER_JOBMASK: akcja (drugi bajt) --
+    pub const NOOP:            i32 = 0x0000
+    pub const INSTALL:         i32 = 0x0100
+    pub const ERASE:           i32 = 0x0200
+    pub const UPDATE:          i32 = 0x0300
+    pub const WEAKENDEPS:      i32 = 0x0400
+    pub const MULTIVERSION:    i32 = 0x0500
+    pub const LOCK:            i32 = 0x0600
+    pub const DISTUPGRADE:     i32 = 0x0700
+    pub const VERIFY:          i32 = 0x0800
+    pub const DROP_ORPHANED:   i32 = 0x0900
+    pub const USERINSTALLED:   i32 = 0x0a00
+    pub const ALLOWUNINSTALL:  i32 = 0x0b00
+    pub const FAVOR:           i32 = 0x0c00
+    pub const DISFAVOR:        i32 = 0x0d00
+    pub const BLACKLIST:       i32 = 0x0e00
+    pub const EXCLUDEFROMWEAK: i32 = 0x1000
+    pub const JOBMASK:         i32 = 0xff00
+
+    ;; -- flagi dodatkowe (górne bajty) --
+    pub const WEAK:       i32 = 0x010000
+    pub const ESSENTIAL:  i32 = 0x020000
+    pub const CLEANDEPS:  i32 = 0x040000
+    pub const ORUPDATE:   i32 = 0x080000
+    pub const FORCEBEST:  i32 = 0x100000
+    pub const TARGETED:   i32 = 0x200000
+    pub const NOTBYUSER:  i32 = 0x400000
+
+    pub fn install_name(q: int, p: int, name: string) is
+        let id: i32 = pool::str2id(p, name, true)
+        queue::push2(q, SOLVABLE_NAME | INSTALL, id)
+    end
+
+    pub fn erase_name(q: int, p: int, name: string) is
+        let id: i32 = pool::str2id(p, name, true)
+        queue::push2(q, SOLVABLE_NAME | ERASE, id)
+    end
+
+    pub fn update_name(q: int, p: int, name: string) is
+        let id: i32 = pool::str2id(p, name, true)
+        queue::push2(q, SOLVABLE_NAME | UPDATE, id)
+    end
+
+    ;; Parsuje operator relacji wersji na flagi REL_* (src/pool.h).
+    ;; Wspierane: "=", "==", ">", "<", ">=", "<=", "!=".
+    fn parse_rel_op(op: string) -> SatResult<i32> is
+        if op == "=" || op == "==" is return SatResult::Ok(pool::REL_EQ) end
+        if op == ">"               is return SatResult::Ok(pool::REL_GT) end
+        if op == "<"               is return SatResult::Ok(pool::REL_LT) end
+        if op == ">="              is return SatResult::Ok(pool::REL_GT | pool::REL_EQ) end
+        if op == "<="              is return SatResult::Ok(pool::REL_LT | pool::REL_EQ) end
+        if op == "!="              is return SatResult::Ok(pool::REL_GT | pool::REL_LT) end
+        return SatResult::Err("nieznany operator porownania wersji: '" + op +
+                               "' (oczekiwano =, ==, >, <, >=, <=, !=)")
+    end
+
+    ;; Wersjonowany odpowiednik install_name(), np.
+    ;; `job::install_name_version(q, p, "foo", ">=", "1.2")` == "foo >= 1.2".
+    ;; Zwraca Id relacji (przydatne do debugowania przez pool::job_to_str)
+    ;; albo błąd, jeśli `op` nie jest rozpoznanym operatorem.
+    pub fn install_name_version(q: int, p: int, name: string, op: string, version: string) -> SatResult<i32> is
+        match parse_rel_op(op) is
+            SatResult::Err(msg) => is
+                return SatResult::Err(msg)
+            end
+            SatResult::Ok(flags) => is
+                let name_id: i32 = pool::str2id(p, name, true)
+                let evr_id:  i32 = pool::str2id(p, version, true)
+                let rel_id:  i32 = pool::rel2id(p, name_id, evr_id, flags)
+                queue::push2(q, SOLVABLE_NAME | INSTALL, rel_id)
+                return SatResult::Ok(rel_id)
+            end
+        end
+    end
+
+    pub fn erase_name_version(q: int, p: int, name: string, op: string, version: string) -> SatResult<i32> is
+        match parse_rel_op(op) is
+            SatResult::Err(msg) => is
+                return SatResult::Err(msg)
+            end
+            SatResult::Ok(flags) => is
+                let name_id: i32 = pool::str2id(p, name, true)
+                let evr_id:  i32 = pool::str2id(p, version, true)
+                let rel_id:  i32 = pool::rel2id(p, name_id, evr_id, flags)
+                queue::push2(q, SOLVABLE_NAME | ERASE, rel_id)
+                return SatResult::Ok(rel_id)
+            end
+        end
+    end
+
+    pub fn install_provides(q: int, p: int, dep: string) is
+        let id: i32 = pool::str2id(p, dep, true)
+        queue::push2(q, SOLVABLE_PROVIDES | INSTALL, id)
+    end
+
+    pub fn install_solvable(q: int, solvable_id: i32) is
+        queue::push2(q, SOLVABLE | INSTALL, solvable_id)
+    end
+
+    pub fn erase_solvable(q: int, solvable_id: i32) is
+        queue::push2(q, SOLVABLE | ERASE, solvable_id)
+    end
+
+    pub fn lock_solvable(q: int, solvable_id: i32) is
+        queue::push2(q, SOLVABLE | LOCK, solvable_id)
+    end
+
+    pub fn verify_all(q: int) is
+        queue::push2(q, SOLVABLE_ALL | VERIFY, 0)
+    end
+
+    pub fn distupgrade_all(q: int) is
+        queue::push2(q, SOLVABLE_ALL | DISTUPGRADE, 0)
+    end
+
+    pub fn update_all(q: int) is
+        queue::push2(q, SOLVABLE_ALL | UPDATE, 0)
+    end
+end
+
+;; ============================================================================
+;; mod solver — cykl życia Solvera, solve(), problemy
+;; ============================================================================
+mod solver is
+    ;; -- SOLVER_FLAG_* (src/solver.h) — flagi konfiguracyjne solvera dla
+    ;; set_flag()/get_flag() (0/1 jako value). Ustaw PRZED solve().
+    pub const FLAG_ALLOW_DOWNGRADE:          i32 = 1
+    pub const FLAG_ALLOW_ARCHCHANGE:         i32 = 2
+    pub const FLAG_ALLOW_VENDORCHANGE:       i32 = 3
+    pub const FLAG_ALLOW_UNINSTALL:          i32 = 4
+    pub const FLAG_NO_UPDATEPROVIDE:         i32 = 5
+    pub const FLAG_SPLITPROVIDES:            i32 = 6
+    pub const FLAG_IGNORE_RECOMMENDED:       i32 = 7
+    pub const FLAG_ADD_ALREADY_RECOMMENDED:  i32 = 8
+    pub const FLAG_NO_INFARCHCHECK:          i32 = 9
+    pub const FLAG_ALLOW_NAMECHANGE:         i32 = 10
+    pub const FLAG_KEEP_EXPLICIT_OBSOLETES:  i32 = 11
+    pub const FLAG_BEST_OBEY_POLICY:         i32 = 12
+    pub const FLAG_NO_AUTOTARGET:            i32 = 13
+    pub const FLAG_DUP_ALLOW_DOWNGRADE:      i32 = 14
+    pub const FLAG_DUP_ALLOW_ARCHCHANGE:     i32 = 15
+    pub const FLAG_DUP_ALLOW_VENDORCHANGE:   i32 = 16
+    pub const FLAG_DUP_ALLOW_NAMECHANGE:     i32 = 17
+    pub const FLAG_KEEP_ORPHANS:             i32 = 18
+    pub const FLAG_BREAK_ORPHANS:            i32 = 19
+    pub const FLAG_FOCUS_INSTALLED:          i32 = 20
+    pub const FLAG_YUM_OBSOLETES:            i32 = 21
+    pub const FLAG_NEED_UPDATEPROVIDE:       i32 = 22
+    pub const FLAG_URPM_REORDER:             i32 = 23
+    pub const FLAG_FOCUS_BEST:               i32 = 24
+    pub const FLAG_STRONG_RECOMMENDS:        i32 = 25
+    pub const FLAG_INSTALL_ALSO_UPDATES:     i32 = 26
+    pub const FLAG_ONLY_NAMESPACE_RECOMMENDED: i32 = 27
+    pub const FLAG_STRICT_REPO_PRIORITY:     i32 = 28
+    pub const FLAG_FOCUS_NEW:                i32 = 29
+
+    pub fn create(p: int) -> int is
+        return solver_create(p)
+    end
+
+    pub fn free(s: int) is
+        solver_free(s)
+    end
+
+    ;; Ustawia flagę solvera (patrz stałe FLAG_* powyżej). Zwraca
+    ;; POPRZEDNIĄ wartość flagi (tak działa solver_set_flag w libsolv).
+    pub fn set_flag(s: int, flag: i32, value: bool) -> i32 is
+        let v: i32 = if value then 1 else 0
+        return solver_set_flag(s, flag, v)
+    end
+
+    pub fn get_flag(s: int, flag: i32) -> bool is
+        return solver_get_flag(s, flag) != 0
+    end
+
+    ;; Wygodne skróty dla najczęściej ustawianych flag.
+    pub fn allow_downgrade(s: int, value: bool) -> i32 is
+        return set_flag(s, FLAG_ALLOW_DOWNGRADE, value)
+    end
+
+    pub fn allow_vendorchange(s: int, value: bool) -> i32 is
+        return set_flag(s, FLAG_ALLOW_VENDORCHANGE, value)
+    end
+
+    pub fn allow_uninstall(s: int, value: bool) -> i32 is
+        return set_flag(s, FLAG_ALLOW_UNINSTALL, value)
+    end
+
+    pub fn best_obey_policy(s: int, value: bool) -> i32 is
+        return set_flag(s, FLAG_BEST_OBEY_POLICY, value)
+    end
+
+    pub fn keep_orphans(s: int, value: bool) -> i32 is
+        return set_flag(s, FLAG_KEEP_ORPHANS, value)
+    end
+
+    ;; Zwraca liczbę nierozwiązanych problemów (0 = sukces, joby spełnione).
+    pub fn solve(s: int, job_queue: int) -> i32 is
+        return solver_solve(s, job_queue)
+    end
+
+    pub fn problem_count(s: int) -> i32 is
+        return solver_problem_count(s)
+    end
+
+    ;; Iteruj: `let mut pr: i32 = 0  while true is pr = solver::next_problem(s, pr) if pr == 0 is break end ... end`
+    pub fn next_problem(s: int, prev: i32) -> i32 is
+        return solver_next_problem(s, prev)
+    end
+
+    pub fn solution_count(s: int, problem: i32) -> i32 is
+        return solver_solution_count(s, problem)
+    end
+
+    pub fn problem_to_str(s: int, problem: i32) -> string is
+        return solver_problem2str(s, problem)
+    end
+
+    ;; Zwraca Id-y reguł powodujących dany problem (nowa kolejka —
+    ;; pamiętaj o queue::free() po użyciu).
+    pub fn find_all_problem_rules(s: int, problem: i32) -> int is
+        let q: int = queue::new()
+        solver_findallproblemrules(s, problem, q)
+        return q
+    end
+
+    ;; Gotowa lista opisów wszystkich problemów jako [string] — najwygodniejsze
+    ;; do wyświetlenia użytkownikowi po nieudanym solve().
+    pub fn all_problems_as_strings(s: int) -> [string] is
+        let mut out: [string] = []
+        let mut pr: i32 = 0
+        let mut go: bool = true
+        while go is
+            pr = next_problem(s, pr)
+            if pr == 0 is
+                go = false
+            else is
+                out = array_push(out, problem_to_str(s, pr))
+            end
+        end
+        return out
+    end
+end
+
+;; ============================================================================
+;; mod transaction — wynik solve(): co zainstalować/usunąć/zaktualizować
+;; ============================================================================
+mod transaction is
+    ;; -- typy kroku transakcji (src/transaction.h) --
+    ;; UWAGA: to DWA równoległe zestawy, nie jedna sekwencja — strona
+    ;; "co się dzieje z już zainstalowanym pakietem" (0x10..0x15) i strona
+    ;; "co się dzieje z pakietem, który wchodzi" (0x20..0x25). Wcześniejsza
+    ;; wersja tego pliku błędnie traktowała je jako jedną ciągłą listę
+    ;; (0..24) — poniższe wartości są zweryfikowane bezpośrednio wobec
+    ;; nagłówka transaction.h.
+    pub const IGNORE:          i32 = 0x00
+
+    ;; strona "zainstalowany pakiet" — co się z nim dzieje
+    pub const ERASE:           i32 = 0x10
+    pub const REINSTALLED:     i32 = 0x11
+    pub const DOWNGRADED:      i32 = 0x12
+    pub const CHANGED:         i32 = 0x13
+    pub const UPGRADED:        i32 = 0x14
+    pub const OBSOLETED:       i32 = 0x15
+
+    ;; strona "nowy/wchodzący pakiet" — skąd się bierze
+    pub const INSTALL:         i32 = 0x20
+    pub const REINSTALL:       i32 = 0x21
+    pub const DOWNGRADE:       i32 = 0x22
+    pub const CHANGE:          i32 = 0x23
+    pub const UPGRADE:         i32 = 0x24
+    pub const OBSOLETES:       i32 = 0x25
+
+    pub const MULTIINSTALL:    i32 = 0x30
+    pub const MULTIREINSTALL:  i32 = 0x31
+
+    ;; -- tryby dla classify()/classify_pkgs()/type_of() (bity, można łączyć |) --
+    pub const MODE_SHOW_ACTIVE:            i32 = 1 << 0
+    pub const MODE_SHOW_ALL:               i32 = 1 << 1
+    pub const MODE_SHOW_OBSOLETES:         i32 = 1 << 2
+    pub const MODE_SHOW_MULTIINSTALL:      i32 = 1 << 3
+    pub const MODE_CHANGE_IS_REINSTALL:    i32 = 1 << 4
+    pub const MODE_MERGE_VENDORCHANGES:    i32 = 1 << 5
+    pub const MODE_MERGE_ARCHCHANGES:      i32 = 1 << 6
+    pub const MODE_RPM_ONLY:               i32 = 1 << 7
+    pub const MODE_KEEP_PSEUDO:            i32 = 1 << 8
+    pub const MODE_OBSOLETE_IS_UPGRADE:    i32 = 1 << 9
+
+    pub fn create_from_solver(s: int) -> int is
+        return solver_create_transaction(s)
+    end
+
+    pub fn free(t: int) is
+        transaction_free(t)
+    end
+
+    ;; Zwraca typ kroku transakcji (jedna ze stałych wyżej) dla danego Id
+    ;; solvable'a (Id-y bierzesz np. z installed_result()).
+    pub fn type_of(t: int, solvable_id: i32, mode: i32) -> i32 is
+        return transaction_type(t, solvable_id, mode)
+    end
+
+    ;; -- transaction_classify: "posortowany zestaw klas kroków" --
+    ;;
+    ;; WAŻNE: `transaction_classify` NIE zwraca płaskiej listy Id
+    ;; solvable'i. Zwraca kolejkę wypełnioną CZWÓRKAMI Id
+    ;; (type, count, from_id, to_id) — po jednej czwórce na każdą klasę
+    ;; kroków obecną w transakcji (potwierdzone wobec SWIG-owych bindingów
+    ;; libsolv, plik bindings/solv.i: `Queue2Array(TransactionClass*, 4, ...)`
+    ;; z polami (type, count, fromid, toid)). Poprzednia wersja tego pliku
+    ;; traktowała tę kolejkę jak zwykłą tablicę Id solvable'i przez
+    ;; `queue::to_array` — to było mylące i błędne. Poniżej dekodujemy
+    ;; czwórki poprawnie na `TransactionClass`.
+    ;;
+    ;; Znaczenie `from_id`/`to_id` zależy od `type_id` — użyj ich razem z
+    ;; classify_pkgs() żeby dostać faktyczne Id pakietów danej klasy.
+    pub struct TransactionClass is
+        pub type_id: i32   ;; jedna ze stałych IGNORE/ERASE/INSTALL/UPGRADE/...
+        pub count:   i32   ;; ile kroków transakcji należy do tej klasy
+        pub from_id: i32
+        pub to_id:   i32
+    end
+
+    pub fn classify(t: int, mode: i32) -> [TransactionClass] is
+        let q: int = queue::new()
+        transaction_classify(t, mode, q)
+        let raw: [i32] = queue::to_array(q)
+        queue::free(q)
+
+        let mut out: [TransactionClass] = []
+        let n: int = array_len(raw)
+        let mut i: int = 0
+        while i + 3 < n is
+            out = array_push(out, TransactionClass {
+                type_id: raw[i], count: raw[i + 1], from_id: raw[i + 2], to_id: raw[i + 3]
+            })
+            i += 4
+        end
+        return out
+    end
+
+    ;; Skrót: classify() z domyślnym trybem MODE_SHOW_ACTIVE.
+    pub fn classify_active(t: int) -> [TransactionClass] is
+        return classify(t, MODE_SHOW_ACTIVE)
+    end
+
+    ;; W przeciwieństwie do classify(), TO zwraca płaską listę Id
+    ;; solvable'i — konkretne pakiety należące do jednej klasy zwróconej
+    ;; wcześniej przez classify() (przekaż jej type_id/from_id/to_id).
+    pub fn classify_pkgs(t: int, mode: i32, class: TransactionClass) -> [i32] is
+        let q: int = queue::new()
+        transaction_classify_pkgs(t, mode, class.type_id, class.from_id, class.to_id, q)
+        let out: [i32] = queue::to_array(q)
+        queue::free(q)
+        return out
+    end
+
+    ;; Pełna lista Id-ów solvable'i po transakcji (stan końcowy "installed")
+    ;; jako zwykła tablica H#.
+    pub fn installed_result(t: int) -> [i32] is
+        let q: int = queue::new()
+        transaction_installedresult(t, q)
+        let out: [i32] = queue::to_array(q)
+        queue::free(q)
+        return out
+    end
+end
