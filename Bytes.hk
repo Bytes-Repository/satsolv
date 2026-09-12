@@ -1,1 +1,15 @@
+[package]
+-> name        => satsolv
+-> version     => 0.1.0
+-> description => Bindingi H# do libsolv (SAT solver zaleznosci pakietow) - 100% H#, extern static
+-> author      => Bytes Developers
+-> license     => MIT
 
+[build]
+-> lang    => h#
+-> entry   => src/lib.h#
+-> output  => build/libsatsolv
+-> emit    => lib
+-> include => src
+
+[deps]
