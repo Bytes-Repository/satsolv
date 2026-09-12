@@ -1,0 +1,235 @@
+use "std -> test" from "test"
+mod lib
+
+;; ── queue: własna implementacja push/get/count na strukturze Queue ──────
+#[test]
+fn test_queue_push_and_count() is
+    let q: int = lib::queue::new()
+    assert_eq(lib::queue::count(q), 0)
+
+    lib::queue::push(q, 10)
+    lib::queue::push(q, 20)
+    lib::queue::push(q, 30)
+
+    assert_eq(lib::queue::count(q), 3)
+    assert_eq(lib::queue::get(q, 0), 10)
+    assert_eq(lib::queue::get(q, 1), 20)
+    assert_eq(lib::queue::get(q, 2), 30)
+
+    lib::queue::free(q)
+end
+
+#[test]
+fn test_queue_push2_and_to_array() is
+    let q: int = lib::queue::new()
+    lib::queue::push2(q, 1, 2)
+    lib::queue::push2(q, 3, 4)
+
+    let arr: [i32] = lib::queue::to_array(q)
+    assert_eq(array_len(arr), 4)
+    assert_eq(arr[0], 1)
+    assert_eq(arr[3], 4)
+
+    lib::queue::free(q)
+end
+
+;; Odtworzenie sekwencji "queue_alloc_one" wielokrotnie — sprawdza, że
+;; rozrost bufora (prawdziwy kod libsolv) działa poprawnie przy wielu
+;; kolejnych push().
+#[test]
+fn test_queue_grows_past_initial_capacity() is
+    let q: int = lib::queue::new()
+    let mut i: i32 = 0
+    while i < 500 is
+        lib::queue::push(q, i)
+        i += 1
+    end
+    assert_eq(lib::queue::count(q), 500)
+    assert_eq(lib::queue::get(q, 499), 499)
+    lib::queue::free(q)
+end
+
+;; ── pool: internowanie stringów ──────────────────────────────────────────
+#[test]
+fn test_pool_str2id_roundtrip() is
+    let p: int = lib::pool::create()
+    let id: i32 = lib::pool::str2id(p, "foobar", true)
+    assert_eq(lib::pool::id2str(p, id), "foobar")
+    lib::pool::free(p)
+end
+
+;; ── pool: porównanie wersji (przez Id, jak dotychczas) ───────────────────
+#[test]
+fn test_pool_evrcmp() is
+    let p: int = lib::pool::create()
+    let v1: i32 = lib::pool::str2id(p, "1.0-1", true)
+    let v2: i32 = lib::pool::str2id(p, "2.0-1", true)
+    let cmp: i32 = lib::pool::evrcmp(p, v1, v2)
+    assert(cmp < 0)
+    lib::pool::free(p)
+end
+
+;; ── pool: porównanie wersji na gołych stringach (bez internowania) ───────
+#[test]
+fn test_pool_evrcmp_str() is
+    let p: int = lib::pool::create()
+    assert(lib::pool::evrcmp_str(p, "1.0-1", "2.0-1") < 0)
+    assert(lib::pool::evrcmp_str(p, "2.0-1", "2.0-1") == 0)
+    assert(lib::pool::evrcmp_str(p, "3.0-1", "2.0-1") > 0)
+    lib::pool::free(p)
+end
+
+;; ── pool: disttype wpływa na semantykę porównań ──────────────────────────
+#[test]
+fn test_pool_set_disttype() is
+    let p: int = lib::pool::create()
+    let old: i32 = lib::pool::set_disttype(p, lib::pool::DISTTYPE_DEB)
+    assert(old >= 0)
+    lib::pool::free(p)
+end
+
+;; ── repo: priorytet czyta to, co zostało zapisane ────────────────────────
+#[test]
+fn test_repo_priority_roundtrip() is
+    let p: int = lib::pool::create()
+    let r: int = lib::repo::create(p, "test-repo")
+    lib::repo::set_priority(r, 42, 7)
+    assert_eq(lib::repo::get_priority(r), 42)
+    lib::repo::free(r, false)
+    lib::pool::free(p)
+end
+
+;; ── repo::add_packages: walidacja odrzuca próbę wstrzyknięcia linii ──────
+;; Pakiet z "\n#>=Pkg: zly 1 1 x86_64" w nazwie wersji NIE powinien nigdy
+;; trafić do testcase_add_testtags — walidacja musi go odrzucić wcześniej.
+#[test]
+fn test_add_packages_rejects_newline_injection() is
+    let p: int = lib::pool::create()
+    let r: int = lib::repo::create(p, "available")
+
+    let evil: lib::repo::Pkg = lib::repo::new_pkg(
+        "foo", "1.0\n#>=Pkg: zly 9.9 1 x86_64", "1", "x86_64"
+    )
+
+    match lib::repo::add_packages(p, r, [evil]) is
+        lib::SatResult::Ok(rc) => is
+            assert(false)  ;; nie powinno się udać
+        end
+        lib::SatResult::Err(msg) => is
+            assert(msg != "")
+        end
+    end
+
+    lib::repo::free(r, false)
+    lib::pool::free(p)
+end
+
+#[test]
+fn test_add_packages_rejects_space_in_name() is
+    let p: int = lib::pool::create()
+    let r: int = lib::repo::create(p, "available")
+    let bad: lib::repo::Pkg = lib::repo::new_pkg("foo bar", "1.0", "1", "x86_64")
+
+    match lib::repo::add_packages(p, r, [bad]) is
+        lib::SatResult::Ok(rc) => is
+            assert(false)
+        end
+        lib::SatResult::Err(msg) => is
+            assert(msg != "")
+        end
+    end
+
+    lib::repo::free(r, false)
+    lib::pool::free(p)
+end
+
+;; ── job: wersjonowany install (>=) ────────────────────────────────────────
+#[test]
+fn test_job_install_name_version() is
+    let p: int = lib::pool::create()
+    let q: int = lib::queue::new()
+
+    match lib::job::install_name_version(q, p, "foo", ">=", "1.2") is
+        lib::SatResult::Ok(rel_id) => is
+            ;; ok — kolejka powinna dostać dwa wpisy (how, what)
+            assert_eq(lib::queue::count(q), 2)
+        end
+        lib::SatResult::Err(msg) => is
+            assert(false)
+        end
+    end
+
+    lib::queue::free(q)
+    lib::pool::free(p)
+end
+
+#[test]
+fn test_job_install_name_version_rejects_bad_op() is
+    let p: int = lib::pool::create()
+    let q: int = lib::queue::new()
+
+    match lib::job::install_name_version(q, p, "foo", "~=", "1.2") is
+        lib::SatResult::Ok(rel_id) => is
+            assert(false)  ;; "~=" nie jest wspieranym operatorem
+        end
+        lib::SatResult::Err(msg) => is
+            assert(msg != "")
+        end
+    end
+
+    lib::queue::free(q)
+    lib::pool::free(p)
+end
+
+;; ── pełny scenariusz: repo "z palca" + install job + solve + transakcja ──
+#[test]
+fn test_full_install_scenario() is
+    let p: int = lib::pool::create()
+    lib::pool::set_arch(p, "x86_64")
+
+    let system: int = lib::repo::create(p, "system")
+    lib::pool::set_installed(p, system)
+    lib::repo::internalize(system)
+
+    let available: int = lib::repo::create(p, "available")
+    lib::repo::set_priority(available, 10, 0)
+
+    let foo: lib::repo::Pkg = lib::repo::new_pkg("foo", "1.0", "1", "x86_64")
+    let mut bar: lib::repo::Pkg = lib::repo::new_pkg("bar", "2.0", "1", "x86_64")
+    bar.requires = ["foo"]
+
+    match lib::repo::add_packages(p, available, [foo, bar]) is
+        lib::SatResult::Ok(rc) => is end
+        lib::SatResult::Err(msg) => is
+            assert(false)
+        end
+    end
+    lib::repo::internalize(available)
+
+    lib::pool::createwhatprovides(p)
+
+    let jobs: int = lib::queue::new()
+    lib::job::install_name(jobs, p, "bar")
+
+    let s: int = lib::solver::create(p)
+    lib::solver::allow_downgrade(s, false)
+    let problems: i32 = lib::solver::solve(s, jobs)
+    assert_eq(problems, 0)
+
+    let t: int = lib::transaction::create_from_solver(s)
+    let installed: [i32] = lib::transaction::installed_result(t)
+    ;; "foo" i "bar" powinny obie trafić na listę do instalacji
+    assert(array_len(installed) >= 2)
+
+    ;; classify() powinno zwrócić przynajmniej jedną klasę kroków
+    ;; (rekordy po 4 pola: type_id/count/from_id/to_id, patrz mod transaction)
+    let classes: [lib::transaction::TransactionClass] = lib::transaction::classify_active(t)
+    assert(array_len(classes) >= 1)
+
+    lib::transaction::free(t)
+    lib::queue::free(jobs)
+    lib::solver::free(s)
+    lib::repo::free(available, false)
+    lib::repo::free(system, false)
+    lib::pool::free(p)
+end
